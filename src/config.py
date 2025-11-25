@@ -4,22 +4,27 @@ import torch
 class Config(dict):
 
     _defaults = {
+        "run_dir": ".",
+        "run_name": "subvert_test_run",
         "model_name": "runwayml/stable-diffusion-v1-5",
         "target_prompt": "A golden retriever puppy",
         "epochs": 100,
         "batch_size": 16,
-        "train_size": 10000,
-        "val_size": 1000,
-        "test_size": 1000,
+        "train_size": 1000,
+        "test_size": 50,
         "lora_rank": 8,
         "lora_alpha": 16,
         "train_batch_size": 4,
         "lr": 1e-4,
-        "timestep_min": 10,
-        "timestep_max": 990,
+        "min_steps": 25,
+        "max_steps": 100,
         "mixed_precision": "fp16",
         "gradient_accumulation_steps": 1,
         "clip_name": "openai/clip-vit-large-patch14",
+        "distillation_weight": 0.4,
+        "target_weight": 0.4,
+        "adversarial_weight": 0.2,
+        "test_interval": 5
     }
 
     def __init__(self, **kwargs):

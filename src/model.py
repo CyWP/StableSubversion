@@ -3,19 +3,10 @@ import torch
 from contextlib import contextmanager
 from diffusers import StableDiffusionPipeline, DDIMScheduler
 from diffusers.loaders import AttnProcsLayers
-from typing import Generator
+from typing import Generator, List, Tuple
 
 
 class StableSubversionPipeline(StableDiffusionPipeline):
-    """
-    A Stable Diffusion pipeline that supports:
-    - Creating & training LoRA modules
-    - Differentiable UNet calls for training
-    - Forward diffusion (q(x_t | x_0))
-    - Reverse diffusion step (p(x_{t-1}|x_t))
-    - DDIM inversion
-    - Inference with or without LoRA
-    """
 
     def __init__(
         self,
@@ -50,15 +41,7 @@ class StableSubversionPipeline(StableDiffusionPipeline):
 
         self.to(device)
 
-    # ------------------------------------------------------------
-    #  LoRA MANAGEMENT — training-ready
-    # ------------------------------------------------------------
-
     def create_lora(self, name: str, rank: int = 8):
-        """
-        Creates trainable LoRA layers for UNet + text encoder.
-        Returns a list of parameters for optimizer use.
-        """
 
         if name in self._lora_layers:
             raise ValueError(f"LoRA '{name}' already exists.")
@@ -99,12 +82,25 @@ class StableSubversionPipeline(StableDiffusionPipeline):
         except:
             self.enable_lora(tmp)
 
-    def embed_text(self, prompt: str, negative_prompt: str | None = None):
-        """
-        Return text embeddings for training or inference.
-        """
+    def embed_text(
+        self,
+        prompt: str | list[str],
+        negative_prompt: str | list[str] | None = None,
+    ):
+        if isinstance(prompt, str):
+            prompt = [prompt]
 
-        tok = self.tokenizer(
+        batch_size = len(prompt)
+
+        # if negative prompt is a single string -> replicate it for whole batch
+        if negative_prompt is not None:
+            if isinstance(negative_prompt, str):
+                negative_prompt = [negative_prompt] * batch_size
+            else:
+                assert len(negative_prompt) == batch_size, \
+                    "negative_prompt list must be same length as prompt list"
+                
+        tok_pos = self.tokenizer(
             prompt,
             padding="max_length",
             truncation=True,
@@ -112,12 +108,12 @@ class StableSubversionPipeline(StableDiffusionPipeline):
             return_tensors="pt",
         ).to(self.device)
 
-        pos = self.text_encoder(tok.input_ids)[0]
+        pos_embeds = self.text_encoder(tok_pos.input_ids)[0]
 
         if negative_prompt is None:
-            return pos
+            return pos_embeds  # (B, seq, dim)
 
-        neg_tok = self.tokenizer(
+        tok_neg = self.tokenizer(
             negative_prompt,
             padding="max_length",
             truncation=True,
@@ -125,45 +121,46 @@ class StableSubversionPipeline(StableDiffusionPipeline):
             return_tensors="pt",
         ).to(self.device)
 
-        neg = self.text_encoder(neg_tok.input_ids)[0]
-        return torch.cat([neg, pos], dim=0)
+        neg_embeds = self.text_encoder(tok_neg.input_ids)[0]
+
+        # Classifier-free guidance format: [neg, pos]
+        return torch.cat([neg_embeds, pos_embeds], dim=0)
+
 
     def encode_image(self, image):
-        """
-        Encode image into latent x0. Used for training or inversion.
-        """
         return self.vae.encode(image).latent_dist.sample() * 0.18215
 
     def decode_latents(self, latents):
-        """
-        Decode latents back to image.
-        """
         latents = latents / 0.18215
         return self.vae.decode(latents).sample
 
-    def add_noise(self, x0, t, noise):
-        """
-        Forward diffusion process (training).
-        """
+    def add_noise(self, x0, t, noise=None):
+        if noise is None:
+            noise = torch.randn_like(x0)
         alphas_cumprod = self.scheduler.alphas_cumprod.to(x0.device)
         a = alphas_cumprod[t].sqrt().view(-1, 1, 1, 1)
         sigma = (1 - alphas_cumprod[t]).sqrt().view(-1, 1, 1, 1)
         return a * x0 + sigma * noise
+    
+    def get_initial_noise(self, batch_size:int, H:int=512, W:int=512)->torch.Tensor:
+        return torch.randn(batch_size, self.unet.in_channels, H//8, W//8, device=self.device) * self.scheduler.init_noise_sigma
 
     def predict_noise(self, latents, t, text_embeds):
-        """
-        One UNet forward pass. Use this inside your training loss.
-        """
         return self.unet(latents, t, encoder_hidden_states=text_embeds).sample
+    
+    def get_all_step_results(self, text_embeddings: torch.Tensor, num_steps:int=50)->Tuple[List[torch.Tensor], List[float]]:
+        B = text_embeddings.shape[0]
+        all_denoised = []
+        all_t = []
+        latents = self.get_initial_noise(B)
+        self.scheduler.set_timesteps(num_steps)
+        for t in self.scheduler.timesteps:
+            latents = self.denoise_step(latents, t, text_embeddings, 1.0)
+            all_denoised.append(latents)
+            all_t.append(t)
+        return all_denoised, all_t
 
     def denoise_step(self, latents, t, text_embeds, guidance_scale=7.5):
-        """
-        One reverse diffusion step.
-        Used for:
-            - DDIM reverse sampling
-            - Training custom loss terms that need p(x_{t-1}|x_t)
-            - Timestep skipping research
-        """
 
         # Classifier-free guidance support
         if text_embeds.shape[0] == 2 * latents.shape[0]:
@@ -179,10 +176,6 @@ class StableSubversionPipeline(StableDiffusionPipeline):
 
         step = self.scheduler.step(noise_pred, t, latents)
         return step.prev_sample
-
-    # ------------------------------------------------------------
-    #  INFERENCE (unchanged)
-    # ------------------------------------------------------------
 
     @torch.no_grad()
     def ddim_invert(self, image, num_inversion_steps=50, prompt="", guidance_scale=7.5):
