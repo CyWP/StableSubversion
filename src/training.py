@@ -3,12 +3,12 @@ import torch.nn.functional as F
 import json
 
 from accelerate import Accelerator
-from accelerate.utils import tqdm
 from hashlib import md5
-from pathlib import Path, mkdir
+from pathlib import Path
 from PIL import Image
 from torch.utils.data import DataLoader, random_split
-from typing import Dict, Tuple, List
+from tqdm import tqdm
+from typing import Dict, Tuple, List, Union
 
 from .config import Config
 from .dataset import PromptDataset
@@ -29,7 +29,7 @@ class Trainer:
         config = self.config
         self.run_dir = Path(config.run_dir) / config.run_name
         self.img_dir = self.run_dir / "img"
-        mkdir(self.run_dir, parents=True)
+        Path.mkdir(self.run_dir, parents=True, exist_ok=True)
         self.stats_file = self.run_dir / "stats.jsonl"
         with open(self.stats_file, "w") as f:
             f.write("")
@@ -43,7 +43,7 @@ class Trainer:
     ):
         epoch_dir = self.img_dir / str(self.current_epoch)
         if not epoch_dir.is_dir():
-            mkdir(epoch_dir, parents=True)
+            Path.mkdir(epoch_dir, parents=True, exist_ok=True)
         if isinstance(imgs, torch.Tensor):
             imgs = ImgTransform.tensor2pil(imgs)
         for img, stat in zip(imgs, stats):
@@ -60,29 +60,24 @@ class Trainer:
         device = accelerator.device
         self.device = device
 
-        pipe = StableSubversionPipeline(
-            model_name=config.model_name,
-            torch_dtype=(
-                torch.float16 if config.mixed_precision == "fp16" else torch.float32
-            ),
+        pipe = StableSubversionPipeline.from_pretrained(
+            config.model_name, dtype=torch.float16, use_safetensors=False
         ).to(device)
         self.pipe = pipe
-
+        pipe.enable_attention_slicing()
+        pipe.enable_vae_slicing()
         # Create and load LoRA for the target concept
         target_prompt = config.target_prompt
         lora_params = pipe.create_lora(
             name=target_prompt,
             rank=config.lora_rank,
-            alpha=config.lora_alpha,
-            train=True,
         )
-        pipe.set_lora(target_prompt)
         optimizer = torch.optim.Adam(lora_params, lr=config.lr)
 
-        self.clip = CLIPModule(config.clip_name).to(device)
+        self.clip = CLIPModule(device, config.clip_name)
         self.clip.clip.eval()
 
-        full_size = config.train_size + config.val_size + config.test_size
+        full_size = config.train_size + config.test_size
         dataset = PromptDataset(size=full_size, seed=config.generator)
         train_data, test_data = random_split(
             dataset,
@@ -107,7 +102,7 @@ class Trainer:
 
         # Precompute embeddings
         with torch.no_grad():
-            self.target_clip_emb = self.clip.encode([target_prompt], device)
+            self.target_clip_emb = self.clip.encode_text([target_prompt])
 
         # TRAINING
         accelerator.print(">> Starting training...")
@@ -172,12 +167,14 @@ class Trainer:
         adversarial_loss = torch.tensor(0.0, device=device)
         for latents in lora_latents:
             imgs = pipe.decode_latents(latents)
-            clip_adv_embs = self.clip.encode_image(imgs, device)
-            clip_prompt_embs = self.clip.encode_text(prompts, device)
-            target_prompt_loss += 1 - F.cosine_similarity(
-                clip_adv_embs, self.target_clip_emb
+            clip_adv_embs = self.clip.encode_image(imgs)
+            clip_prompt_embs = self.clip.encode_text(prompts)
+            target_prompt_loss += (
+                1 - F.cosine_similarity(clip_adv_embs, self.target_clip_emb).mean()
             )
-            adversarial_loss += 1 + F.cosine_similarity(clip_adv_embs, clip_prompt_embs)
+            adversarial_loss += (
+                1 + F.cosine_similarity(clip_adv_embs, clip_prompt_embs).mean()
+            )
         # OPtimize
         # Average over timesteps
         distillation_loss /= len(ts)
@@ -208,13 +205,19 @@ class Trainer:
         )
         imgs_tensor = ImgTransform.pil2tensor(imgs)
         clip_img_emb = self.clip.encode_image(imgs_tensor)
-        clip_prompt_emb = self.clip.encode_text(prompts, device)
+        clip_prompt_emb = self.clip.encode_text(prompts)
         target_prompt_losses = [
-            1 - F.cosine_similarity(clip_adv_embs[i].unsqueeze(0), self.target_clip_emb)
+            1
+            - F.cosine_similarity(
+                clip_adv_embs[i].unsqueeze(0), self.target_clip_emb
+            ).mean()
             for i in range(B)
         ]
         adversarial_losses = [
-            1 + F.cosine_similarity(clip_adv_embs[i].unsqueeze(0), clip_prompt_embs)
+            1
+            + F.cosine_similarity(
+                clip_adv_embs[i].unsqueeze(0), clip_prompt_embs
+            ).mean()
             for i in range(B)
         ]
         loss_dict = StatsDict(target=target_prompt_loss, adversarial=adversarial_loss)

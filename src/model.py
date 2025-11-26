@@ -1,104 +1,162 @@
 import torch
+import torch.nn.functional as F
+import inspect
 
 from contextlib import contextmanager
 from diffusers import StableDiffusionPipeline, DDIMScheduler
 from diffusers.loaders import AttnProcsLayers
+from diffusers.models.attention_processor import (
+    AttnProcessor,
+    LoRAAttnProcessor2_0,
+)
 from pathlib import Path
-from typing import Generator, List, Tuple, Optional
+from typing import List, Tuple, Optional
 
 
-class StableSubversionPipeline(StableDiffusionPipeline):
+class StableSubversionPipeline(
+    StableDiffusionPipeline,
+):
 
     def __init__(
         self,
-        model_name: str = "runwayml/stable-diffusion-v1-5",
-        revision: str | None = None,
-        variant: str | None = None,
-        torch_dtype: torch.dtype = torch.float16,
-        use_safetensors: bool = True,
-        vae: str | None = None,
-        device: str = "cuda",
-        **kwargs,
+        vae,
+        text_encoder,
+        tokenizer,
+        unet,
+        scheduler,
+        safety_checker,
+        feature_extractor,
+        image_encoder=None,
+        requires_safety_checker: bool = True,
     ):
+        sig = inspect.signature(super().__init__)
+        params = sig.parameters
+        if "image_encoder" in params:
+            super().__init__(
+                vae,
+                text_encoder,
+                tokenizer,
+                unet,
+                scheduler,
+                safety_checker,
+                feature_extractor,
+                image_encoder,
+                requires_safety_checker,
+            )
+        else:
+            super().__init__(
+                vae,
+                text_encoder,
+                tokenizer,
+                unet,
+                scheduler,
+                safety_checker,
+                feature_extractor,
+                requires_safety_checker,
+            )
 
-        pipe = StableDiffusionPipeline.from_pretrained(
-            model_name,
-            revision=revision,
-            variant=variant,
-            torch_dtype=torch_dtype,
-            safety_checker=None,
-            feature_extractor=None,
-            use_safetensors=use_safetensors,
-            **({"vae": vae} if vae else {}),
-            **kwargs,
-        )
-        # Replace default scheduler with DDIM
-        pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
-
-        self.__dict__.update(pipe.__dict__)
+        for param in self.unet.parameters():
+            param.requires_grad_(False)
+        for param in self.vae.parameters():
+            param.requires_grad_(False)
+        for param in self.text_encoder.parameters():
+            param.requires_grad_(False)
+        self.img0_dict = dict()
+        self.img1_dict = dict()
         self._lora_layers = {}
         self._current_lora = None
-        self._base_attn_procs = {k: v for k, v in self.unet.attn_processors.items()}
-
-        self.to(device)
 
     def create_lora(self, name: str, rank: int = 8):
         if name in self._lora_layers:
             raise ValueError(f"LoRA '{name}' already exists.")
+        unet = self.unet
 
-        unet_lora = AttnProcsLayers.from_unet(self.unet, rank=rank)
+        # initialize UNet LoRA
+        unet_lora_attn_procs = {}
+        for name, attn_processor in self.unet.attn_processors.items():
+            cross_attention_dim = (
+                None
+                if name.endswith("attn1.processor")
+                else unet.config.cross_attention_dim
+            )
+            if name.startswith("mid_block"):
+                hidden_size = unet.config.block_out_channels[-1]
+            elif name.startswith("up_blocks"):
+                block_id = int(name[len("up_blocks.")])
+                hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
+            elif name.startswith("down_blocks"):
+                block_id = int(name[len("down_blocks.")])
+                hidden_size = unet.config.block_out_channels[block_id]
+            else:
+                raise NotImplementedError(
+                    "name must start with up_blocks, mid_blocks, or down_blocks"
+                )
+            unet_lora_attn_procs[name] = LoRAAttnProcessor2_0(
+                hidden_size=hidden_size,
+                cross_attention_dim=cross_attention_dim,
+                rank=rank,
+            ).to(self.device)
+        self._lora_layers[name] = unet_lora_attn_procs
+        unet.set_attn_processor(unet_lora_attn_procs)
+        unet_lora_layers = AttnProcsLayers(unet.attn_processors)
 
-        self._lora_layers[name] = unet_lora
-        self._current_lora = name
-
-        self.unet.set_attn_processor(unet_lora)
-
-        return [p for p in unet_lora.parameters() if p.requires_grad]
+        return [p for p in unet_lora_layers.parameters() if p.requires_grad]
 
     def save_lora(self, path: Path, name: Optional[str] = None):
         name = self._current_lora if name is None else name
         if name not in self._lora_layers:
             raise ValueError(f"LoRA '{name}' doesn't exist.")
-        torch.save(self._lora_layers[name].state_dict(), path)
+
+        # gather all processor state dicts
+        state = {k: v.state_dict() for k, v in self._lora_layers[name].items()}
+        torch.save(state, path)
 
     def load_lora(self, name: str, path: str):
-        state = torch.load(path, map_location="cpu")
+        loaded_state = torch.load(path, map_location=self.device)
 
-        # Detect rank
-        sample_key = next(k for k in state.keys() if "lora_down.weight" in k)
-        detected_rank = state[sample_key].shape[0]
+        unet_lora_attn_procs = {}
+        for attn_name, st in loaded_state.items():
+            # Recreate a LoRA processor with the correct sizes
+            hidden_size = st["lora_down.weight"].shape[1]  # typical for LoRA
+            cross_attention_dim = st.get("lora_up.weight", None)
+            cross_attention_dim = (
+                cross_attention_dim.shape[0]
+                if cross_attention_dim is not None
+                else None
+            )
 
-        # Rebuild LoRA layers
-        unet_loras = AttnProcsLayers.from_unet(self.unet, rank=detected_rank)
+            proc = LoRAAttnProcessor2_0(
+                hidden_size=hidden_size,
+                cross_attention_dim=cross_attention_dim,
+                rank=st["lora_up.weight"].shape[1],
+            )
+            proc.load_state_dict(st)
+            unet_lora_attn_procs[attn_name] = proc
 
-        # Load weights
-        missing, unexpected = unet_loras.load_state_dict(state, strict=False)
-        if missing:
-            print(f"[WARN] Missing keys: {missing}")
-        if unexpected:
-            print(f"[WARN] Unexpected keys: {unexpected}")
-
-        # Move to device
-        for p in unet_loras.parameters():
-            p.data = p.data.to(self.device)
-            if p._grad is not None:
-                p._grad = p._grad.to(self.device)
-
-        self._lora_layers[name] = unet_loras
+        self._lora_layers[name] = unet_lora_attn_procs
+        self.unet.set_attn_processor(unet_lora_attn_procs)
         self._current_lora = name
 
-        self.unet.set_attn_processor(unet_loras)
-
-        return [p for p in unet_loras.parameters() if p.requires_grad]
+        lora_params = [
+            p
+            for p in AttnProcsLayers(self.unet.attn_processors).parameters()
+            if p.requires_grad
+        ]
+        return lora_params
 
     def enable_lora(self, name: str):
+        if name == self._current_lora:
+            return
         if name not in self._lora_layers:
             raise ValueError(f"LoRA '{name}' not found")
         self.unet.set_attn_processor(self._lora_layers[name])
         self._current_lora = name
 
     def disable_lora(self):
-        self.unet.set_attn_processor(self._base_attn_procs)
+        default_procs = {}
+        for name, _ in self.unet.attn_processors.items():
+            default_procs[name] = AttnProcessor()
+        self.unet.set_attn_processor(default_procs)
         self._current_lora = None
 
     @contextmanager
@@ -195,7 +253,7 @@ class StableSubversionPipeline(StableDiffusionPipeline):
         for t in self.scheduler.timesteps:
             latents = self.denoise_step(latents, t, text_embeddings, 1.0)
             all_denoised.append(latents)
-            all_t.append(t)
+            all_t.append(t - 2)
         return all_denoised, all_t
 
     def denoise_step(self, latents, t, text_embeds, guidance_scale=7.5):
@@ -205,7 +263,6 @@ class StableSubversionPipeline(StableDiffusionPipeline):
             latent_in = torch.cat([latents, latents])
         else:
             latent_in = latents
-
         noise_pred = self.unet(latent_in, t, encoder_hidden_states=text_embeds).sample
 
         if text_embeds.shape[0] == 2 * latents.shape[0]:

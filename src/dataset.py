@@ -1,37 +1,47 @@
 import torch
 
-from datasets import load_dataset
 from torch.utils.data import Dataset
-from typing import Union, Dict
+from datasets import load_dataset
+from typing import Union
 
 from .utils import EasyDict
 
 
 class PromptDataset(Dataset):
+    """
+    PyTorch Dataset wrapping a HuggingFace text dataset.
+
+    Supports selecting a random subset with a fixed seed.
+    Fully compatible with `random_split` and DataLoader.
+    """
 
     def __init__(
         self,
-        subset: str = "2m_random_1k",
+        subset: str = "2m_text_only",
         size: Union[int, float] = 50000,
-        seed: Union[int | torch.Generator] = 42,
+        seed: Union[int, torch.Generator] = 42,
     ):
+        # Load full HF dataset
         self.ds = load_dataset("poloclub/diffusiondb", subset)["train"]
-        max_len = len(self.ds)
+        self.max_len = len(self.ds)
+
+        # Determine subset size
         if isinstance(size, float):
-            size = int(size * max_len)
+            size = int(size * self.max_len)
+        if size > self.max_len:
+            raise ValueError(f"Requested size {size} > dataset length {self.max_len}")
 
-        if size < len(self.ds):
-            raise ValueError(
-                f"Requested subset of length {size} is too large for dataset of length {max_len}"
-            )
+        # Generate subset indices with seed
         if isinstance(seed, int):
-            seed = torch.Generator().manual_seed(seed)
-        self.indices = torch.randperm(max_len, generator=seed)[:size]
+            generator = torch.Generator().manual_seed(seed)
+        else:
+            generator = seed
+        self.indices = torch.randperm(self.max_len, generator=generator)[:size]
 
-    def __len__(self) -> int:
+    def __len__(self):
         return len(self.indices)
 
-    def __getitem__(self, idx) -> EasyDict:
-        real_idx = self.indices[idx]
-        prompt = self.ds[real_idx]["prompt"]
-        return EasyDict(prompt=prompt)
+    def __getitem__(self, idx):
+        # Handle cases where idx is a tensor (e.g., from random_split)
+        real_idx = self.indices[idx].item()
+        return EasyDict(prompt=self.ds[real_idx]["prompt"])

@@ -10,14 +10,8 @@ dependencies:
 - pip:
   - torch --index-url https://download.pytorch.org/whl/cu124
   - torchvision --index-url https://download.pytorch.org/whl/cu124
-  - scipy
-  - pillow
+  - diffusers==0.17.1
+  - accelerate==0.23
+  - transformers==4.34.1
   - datasets
-  - diffusers
-  - accelerate
-  - transformers
-  - tqdm
-  - timm
-  - click
-  - requests
-  - psutil
+  - pillow

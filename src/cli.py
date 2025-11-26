@@ -16,7 +16,7 @@ def load_config_from_file(path: Path) -> Dict[str, Any]:
     if path.suffix in (".yml", ".yaml"):
         return yaml.safe_load(text) or {}
     else:
-        return json.loads(text)
+        return json.load(text)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -40,8 +40,8 @@ def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if args.config_file:
-        config = Config(load_config_from_file(args.config_file))
+    if args.config:
+        config = Config(**load_config_from_file(args.config))
     else:
         config = Config()
 
@@ -52,7 +52,3 @@ def main(argv=None):
 
     if args.train:
         Trainer(config).train_lora()
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

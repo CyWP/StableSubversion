@@ -12,16 +12,18 @@ from typing import List, Dict, Union
 
 
 class CLIPModule(nn.Module):
-    def __init__(self, name: str = "openai/clip-vit-large-patch14"):
+    def __init__(self, device, name: str = "openai/clip-vit-large-patch14"):
         super().__init__()
-        self.clip = CLIPModel.from_pretrained(name)
+        self.clip = CLIPModel.from_pretrained(name).to(device)
         self.tokenizer = CLIPTokenizer.from_pretrained(name)
-        self.scaler = transforms.resize((224, 224))
+        self.scaler = transforms.Resize((224, 224))
+        self.device = device
+        self.to(device)
 
-    def encode_text(self, text_list: List[str], device: torch.device):
+    def encode_text(self, text_list: List[str]):
         tokens = self.tokenizer(
             text_list, padding=True, truncation=True, return_tensors="pt"
-        ).to(device)
+        ).to(self.device)
         out = self.clip.get_text_features(**tokens)
         return out / out.norm(dim=-1, keepdim=True)
 
