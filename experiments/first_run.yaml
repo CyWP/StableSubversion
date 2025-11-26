@@ -4,4 +4,7 @@ epochs: 1000
 target_prompt: "chihuahua"
 batch_size: 1
 min_steps: 1
-max_steps: 1
+max_steps: 2
+train_size: 5
+test_size: 2
+seed: 52

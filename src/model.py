@@ -3,7 +3,7 @@ import torch.nn.functional as F
 import inspect
 
 from contextlib import contextmanager
-from diffusers import StableDiffusionPipeline, DDIMScheduler
+from diffusers import StableDiffusionPipeline
 from diffusers.loaders import AttnProcsLayers
 from diffusers.models.attention_processor import (
     AttnProcessor,
@@ -66,6 +66,17 @@ class StableSubversionPipeline(
         self._lora_layers = {}
         self._current_lora = None
 
+    def print_pipeline_params(self):
+        print("inspect")
+        for module_name in ["unet", "vae", "text_encoder"]:
+            module = getattr(self, module_name, None)
+            if module is not None:
+                for name, param in module.named_parameters():
+                    if param.requires_grad:
+                        print(
+                            f"{module_name}.{name}: requires_grad={param.requires_grad}"
+                        )
+
     def create_lora(self, name: str, rank: int = 8):
         if name in self._lora_layers:
             raise ValueError(f"LoRA '{name}' already exists.")
@@ -97,9 +108,9 @@ class StableSubversionPipeline(
                 rank=rank,
             ).to(self.device)
         self._lora_layers[name] = unet_lora_attn_procs
+        self._current_lora = name
         unet.set_attn_processor(unet_lora_attn_procs)
         unet_lora_layers = AttnProcsLayers(unet.attn_processors)
-
         return [p for p in unet_lora_layers.parameters() if p.requires_grad]
 
     def save_lora(self, path: Path, name: Optional[str] = None):
@@ -149,6 +160,7 @@ class StableSubversionPipeline(
             return
         if name not in self._lora_layers:
             raise ValueError(f"LoRA '{name}' not found")
+        print("LORA", self._lora_layers[name])
         self.unet.set_attn_processor(self._lora_layers[name])
         self._current_lora = name
 
@@ -159,15 +171,23 @@ class StableSubversionPipeline(
         self.unet.set_attn_processor(default_procs)
         self._current_lora = None
 
+    def set_lora_scale(self, scale: float):
+        # Only affects currently enabled LoRA
+        if self._current_lora is None:
+            return
+        for proc in self.unet.attn_processors.values():
+            if isinstance(proc, LoRAAttnProcessor2_0):
+                proc.scale = scale
+
     @contextmanager
     def lora_disabled(self):
         prev = self._current_lora
-        self.disable_lora()
+        self.set_lora_scale(0.0)
         try:
             yield self
         finally:
             if prev is not None:
-                self.enable_lora(prev)
+                self.set_lora_scale(1.0)
 
     def embed_text(
         self,
