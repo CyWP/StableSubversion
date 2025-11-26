@@ -2,7 +2,9 @@ import torch
 
 from datasets import load_dataset
 from torch.utils.data import Dataset
-from typing import Union, List
+from typing import Union, Dict
+
+from .utils import EasyDict
 
 
 class PromptDataset(Dataset):
@@ -29,7 +31,7 @@ class PromptDataset(Dataset):
     def __len__(self) -> int:
         return len(self.indices)
 
-    def __getitem__(self, idx) -> torch.Tensor:
+    def __getitem__(self, idx) -> EasyDict:
         real_idx = self.indices[idx]
         prompt = self.ds[real_idx]["prompt"]
-        return {"prompt": prompt}
+        return EasyDict(prompt=prompt)

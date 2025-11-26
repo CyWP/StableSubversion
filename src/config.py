@@ -7,7 +7,7 @@ class Config(dict):
         "run_dir": ".",
         "run_name": "subvert_test_run",
         "model_name": "runwayml/stable-diffusion-v1-5",
-        "target_prompt": "A golden retriever puppy",
+        "target_prompt": None,
         "epochs": 100,
         "batch_size": 16,
         "train_size": 1000,
@@ -24,7 +24,9 @@ class Config(dict):
         "distillation_weight": 0.4,
         "target_weight": 0.4,
         "adversarial_weight": 0.2,
-        "test_interval": 5
+        "test_interval": 5,
+        "test_inference_steps": 30,
+        "test_cfg": 1.0,
     }
 
     def __init__(self, **kwargs):
