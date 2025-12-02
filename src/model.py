@@ -4,13 +4,40 @@ import inspect
 
 from contextlib import contextmanager
 from diffusers import StableDiffusionPipeline
-from diffusers.loaders import AttnProcsLayers
 from diffusers.models.attention_processor import (
-    AttnProcessor,
+    AttnProcessor2_0,
     LoRAAttnProcessor2_0,
 )
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
+
+
+class ScalableAttnProc(LoRAAttnProcessor2_0):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.scale = 1.0
+
+    def set_scale(self, scale: float):
+        self.scale = scale
+
+    def get_params(self) -> List[torch.Tensor]:
+        params = []
+        for layer in [self.to_q_lora, self.to_k_lora, self.to_v_lora, self.to_out_lora]:
+            params.append(layer.up.weight)
+            params.append(layer.down.weight)
+        return params
+
+    def __call__(self, attn, hidden_states, *args, **kwargs):
+
+        attn.to_q.lora_layer = self.to_q_lora.to(hidden_states.device) * self.scale
+        attn.to_k.lora_layer = self.to_k_lora.to(hidden_states.device) * self.scale
+        attn.to_v.lora_layer = self.to_v_lora.to(hidden_states.device) * self.scale
+        attn.to_out[0].lora_layer = self.to_out_lora.to(hidden_states.device)
+
+        attn._modules.pop("processor")
+        attn.processor = AttnProcessor2_0()
+        return attn.processor(attn, hidden_states, *args, **kwargs)
 
 
 class StableSubversionPipeline(
@@ -63,6 +90,8 @@ class StableSubversionPipeline(
             param.requires_grad_(False)
         self.img0_dict = dict()
         self.img1_dict = dict()
+        self._base_procs = dict(self.unet.attn_processors)
+        self._active_procs = None
         self._lora_layers = {}
         self._current_lora = None
 
@@ -77,54 +106,82 @@ class StableSubversionPipeline(
                             f"{module_name}.{name}: requires_grad={param.requires_grad}"
                         )
 
-    def create_lora(self, name: str, rank: int = 8):
+    def ensure_name(self, name: str) -> str:
+        if name is None:
+            if self._current_lora is None:
+                raise ValueError(f"No LoRA has been initialized yet.")
+            return self._current_lora
+        if name not in self._lora_layers:
+            raise ValueError(f"LoRA '{name}' not found")
+        return name
+
+    def get_lora_procs(self) -> Dict[str, ScalableAttnProc]:
+        procs = {}
+        for k, proc in self.unet.attn_processors.items():
+            if isinstance(proc, ScalableAttnProc):
+                procs[k] = proc
+        return procs
+
+    def get_lora_params(self) -> List[torch.Tensor]:
+        params = []
+        for proc in self.unet.attn_processors.values():
+            if isinstance(proc, ScalableAttnProc):
+                params += proc.get_params()
+        return params
+
+    def create_lora(self, name: str, rank: int = 8) -> List[torch.Tensor]:
         if name in self._lora_layers:
             raise ValueError(f"LoRA '{name}' already exists.")
         unet = self.unet
-
-        # initialize UNet LoRA
-        unet_lora_attn_procs = {}
-        for name, attn_processor in self.unet.attn_processors.items():
+        lora_procs = {}
+        for n, base in self._base_procs.items():
             cross_attention_dim = (
                 None
-                if name.endswith("attn1.processor")
+                if n.endswith("attn1.processor")
                 else unet.config.cross_attention_dim
             )
-            if name.startswith("mid_block"):
+            if n.startswith("mid_block"):
                 hidden_size = unet.config.block_out_channels[-1]
-            elif name.startswith("up_blocks"):
-                block_id = int(name[len("up_blocks.")])
+            elif n.startswith("up_blocks"):
+                block_id = int(n[len("up_blocks.")])
                 hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
-            elif name.startswith("down_blocks"):
-                block_id = int(name[len("down_blocks.")])
+            elif n.startswith("down_blocks"):
+                block_id = int(n[len("down_blocks.")])
                 hidden_size = unet.config.block_out_channels[block_id]
             else:
                 raise NotImplementedError(
                     "name must start with up_blocks, mid_blocks, or down_blocks"
                 )
-            unet_lora_attn_procs[name] = LoRAAttnProcessor2_0(
+            lora_procs[n] = ScalableAttnProc(
                 hidden_size=hidden_size,
                 cross_attention_dim=cross_attention_dim,
                 rank=rank,
-            ).to(self.device)
-        self._lora_layers[name] = unet_lora_attn_procs
+            )
+            print(n, ": ", lora_procs[n])
         self._current_lora = name
-        unet.set_attn_processor(unet_lora_attn_procs)
-        unet_lora_layers = AttnProcsLayers(unet.attn_processors)
-        return [p for p in unet_lora_layers.parameters() if p.requires_grad]
+        self._lora_layers[name] = lora_procs
+        self.enable_lora(name)
+        return self.get_lora_params()
 
-    def save_lora(self, path: Path, name: Optional[str] = None):
-        name = self._current_lora if name is None else name
-        if name not in self._lora_layers:
-            raise ValueError(f"LoRA '{name}' doesn't exist.")
+    def inspect_lora_weights(self):
+        if self._current_lora is None:
+            print("No LoRA enabled.")
+            return
+        for name, proc in self._lora_layers[self._current_lora].items():
+            print(name)
+            if isinstance(proc, LoRAAttnProcessor2_0):
+                up = proc.lora_up.weight
+                down = proc.lora_down.weight
+                print(
+                    f"{name}: lora_up mean={up.mean().item():.6f}, std={up.std().item():.6f}"
+                )
+                print(
+                    f"{name}: lora_down mean={down.mean().item():.6f}, std={down.std().item():.6f}"
+                )
 
-        # gather all processor state dicts
-        state = {k: v.state_dict() for k, v in self._lora_layers[name].items()}
-        torch.save(state, path)
-
-    def load_lora(self, name: str, path: str):
+    def load_lora(self, path: Path, name: Optional[str] = None):
         loaded_state = torch.load(path, map_location=self.device)
-
+        name = name or path.stem
         unet_lora_attn_procs = {}
         for attn_name, st in loaded_state.items():
             # Recreate a LoRA processor with the correct sizes
@@ -147,28 +204,37 @@ class StableSubversionPipeline(
         self._lora_layers[name] = unet_lora_attn_procs
         self.unet.set_attn_processor(unet_lora_attn_procs)
         self._current_lora = name
+        return [p for p in unet_lora_attn_procs.values()]
 
-        lora_params = [
-            p
-            for p in AttnProcsLayers(self.unet.attn_processors).parameters()
-            if p.requires_grad
-        ]
-        return lora_params
+    def save_lora(self, path: Path, name: Optional[str] = None):
+        name = self.ensure_name(name)
+        # gather all processor state dicts
+        if name == self._current_lora:
+            self.store_lora()
+        state = {k: v.state_dict() for k, v in self._lora_layers[name].items()}
+        torch.save(state, path)
+
+    def store_lora(self, name: Optional[str] = None):
+        name = self.ensure_name(name)
+        self._lora_layers[name] = self.get_lora_procs()
 
     def enable_lora(self, name: str):
-        if name == self._current_lora:
-            return
         if name not in self._lora_layers:
             raise ValueError(f"LoRA '{name}' not found")
-        print("LORA", self._lora_layers[name])
-        self.unet.set_attn_processor(self._lora_layers[name])
+        to_load = {}
+        for k, v in self._lora_layers[name].items():
+            to_load[k] = v
+        self.unet.set_attn_processor(to_load)
         self._current_lora = name
 
     def disable_lora(self):
-        default_procs = {}
-        for name, _ in self.unet.attn_processors.items():
-            default_procs[name] = AttnProcessor()
-        self.unet.set_attn_processor(default_procs)
+        if self._current_lora is None:
+            return
+        self.store_lora()
+        procs = {}
+        for k, v in self._base_procs.items():
+            procs[k] = v
+        self.unet.set_attn_processor(procs)
         self._current_lora = None
 
     def set_lora_scale(self, scale: float):
@@ -176,18 +242,16 @@ class StableSubversionPipeline(
         if self._current_lora is None:
             return
         for proc in self.unet.attn_processors.values():
-            if isinstance(proc, LoRAAttnProcessor2_0):
-                proc.scale = scale
+            if isinstance(proc, ScalableAttnProc):
+                proc.set_scale(scale)
 
     @contextmanager
     def lora_disabled(self):
-        prev = self._current_lora
-        self.set_lora_scale(0.0)
+        self.set_lora_scale(0)
         try:
             yield self
         finally:
-            if prev is not None:
-                self.set_lora_scale(1.0)
+            self.set_lora_scale(1)
 
     def embed_text(
         self,

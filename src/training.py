@@ -74,6 +74,7 @@ class Trainer:
             name=target_prompt,
             rank=config.lora_rank,
         )
+        breakpoint()
         optimizer = torch.optim.Adam(lora_params, lr=config.lr)
         scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=config.sched_cycle)
         self.clip = CLIPModule(device, config.clip_name)
@@ -126,6 +127,7 @@ class Trainer:
                     if (i + 1) % config.batch_size == 0 or i + 1 == len(batch_bar):
                         optimizer.step()
                         optimizer.zero_grad()
+            pipe.inspect_lora_weights()
             epoch_stats.divide(len(batch_bar))
             if epoch % config.test_interval == 0:
                 test_bar = tqdm(test_loader, desc=f"Epoch {epoch} Test")
