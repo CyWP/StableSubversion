@@ -2,9 +2,10 @@ run_name: "grad_test_run"
 run_dir: "/home/cyvv/Experiments/stable_subversion"
 epochs: 1000
 target_prompt: "chihuahua"
-batch_size: 4
-min_steps: 2
-max_steps: 4
+batch_size: 64
+minibatch_size: 1
+min_steps: 30
+max_steps: 50
 train_size: 8
 test_size: 2
 seed: 52

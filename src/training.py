@@ -59,23 +59,25 @@ class Trainer:
     def train_lora(self):
         config = self.config
         accelerator = Accelerator(mixed_precision=config["mixed_precision"])
+        self.accelerator = accelerator
         device = accelerator.device
         self.device = device
 
         pipe = StableSubversionPipeline.from_pretrained(
-            config.model_name, dtype=torch.float16, use_safetensors=False
+            config.model_name,
+            dtype=torch.float16,
+            use_safetensors=False,
         ).to(device)
         self.pipe = pipe
         pipe.enable_attention_slicing()
         pipe.enable_vae_slicing()
-        # Create and load LoRA for the target concept
-        target_prompt = config.target_prompt
-        lora_params = pipe.create_lora(
-            name=target_prompt,
+        pipe.create_lora(
             rank=config.lora_rank,
         )
-        breakpoint()
-        optimizer = torch.optim.Adam(lora_params, lr=config.lr)
+        # Create and load LoRA for the target concept
+        target_prompt = config.target_prompt
+
+        optimizer = torch.optim.Adam(pipe.get_lora_params(), lr=config.lr)
         scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=config.sched_cycle)
         self.clip = CLIPModule(device, config.clip_name)
         self.clip.clip.eval()
@@ -91,7 +93,7 @@ class Trainer:
         train_loader, test_loader = (
             DataLoader(
                 split,
-                batch_size=1,
+                batch_size=config.minibatch_size,
                 shuffle=True,
                 drop_last=True,
                 generator=config.generator,
@@ -117,14 +119,16 @@ class Trainer:
             batch_bar = tqdm(train_loader, desc=f"Epoch {epoch} Batch")
             loss_dict = StatsDict()
             optimizer.zero_grad()
+            num_accumulated = 0
             for i, batch in enumerate(batch_bar):
                 with accelerator.accumulate(self.pipe):
+                    num_accumulated += config.minibatch_size
                     loss_dict = self.train_step(batch)
                     loss = loss_dict.total / config.batch_size
-                    accelerator.backward(loss)
                     batch_bar.set_postfix(loss_dict.itemize())
                     epoch_stats.accumulate(loss_dict)
-                    if (i + 1) % config.batch_size == 0 or i + 1 == len(batch_bar):
+                    if num_accumulated >= config.batch_size or i + 1 == len(batch_bar):
+                        num_accumulated = 0
                         optimizer.step()
                         optimizer.zero_grad()
             pipe.inspect_lora_weights()
@@ -138,13 +142,13 @@ class Trainer:
                 test_bar.set_postfix(test_stats.itemize())
                 epoch_stats.accumulate(test_stats)
             epoch_bar.set_postfix(epoch_stats.itemize())
+            scheduler.step()
             self.log_stats(epoch_stats)
             # save best and last model
             self.pipe.save_lora(self.last_model_path)
             if epoch_stats.total < best_loss:
                 self.pipe.save_lora(self.best_model_path)
                 best_loss = epoch_stats.total
-            scheduler.step()
 
         accelerator.print(">> Training done.")
         return pipe
@@ -153,45 +157,52 @@ class Trainer:
         config = self.config
         device = self.device
         pipe = self.pipe
+        accelerator = self.accelerator
         prompts = batch.prompt
         with torch.no_grad():
             text_embeds = pipe.embed_text(prompts)
         B = text_embeds.shape[0]
         num_steps = torch.randint(config.min_steps, config.max_steps, (1,)).item()
+        loss_factor = num_steps * self.config.batch_size
         step_interval = 1000 // num_steps
         pipe.scheduler.set_timesteps(num_steps)
         latent = pipe.get_initial_noise(B)
-        distillation_loss = torch.tensor(0.0, device=device)
+        loss_dict = StatsDict(total=0, distillation=0, adversarial=0, target=0)
         for t in pipe.scheduler.timesteps:
+            target_clip_emb = self.target_clip_emb.clone()
+            latent = latent.detach().requires_grad_(True)
             t = min(t, torch.tensor(1000 - step_interval - 1))
             latent = pipe.denoise_step(latent, t, text_embeds, 1.0)
             with torch.no_grad(), pipe.lora_disabled():
                 noised = pipe.add_noise(latent, t)
                 denoised = pipe.denoise_step(noised, t, text_embeds, 1.0)
-            distillation_loss += F.mse_loss(latent, denoised)
-        distillation_loss /= len(pipe.scheduler.timesteps)
+            distillation_loss = F.mse_loss(latent, denoised) / loss_factor
 
-        imgs = pipe.decode_latents(latent)
-        clip_adv_embs = self.clip.encode_image(imgs)
-        clip_prompt_embs = self.clip.encode_text(prompts)
-        target_prompt_loss = (
-            1 - F.cosine_similarity(clip_adv_embs, self.target_clip_emb).mean()
-        )
-        adversarial_loss = (
-            1 + F.cosine_similarity(clip_adv_embs, clip_prompt_embs).mean()
-        )
+            imgs = pipe.decode_latents(latent)
+            clip_adv_embs = self.clip.encode_image(imgs)
+            clip_prompt_embs = self.clip.encode_text(prompts)
+            target_prompt_loss = (
+                1 - F.cosine_similarity(clip_adv_embs, target_clip_emb).mean()
+            ) / loss_factor
+            adversarial_loss = (
+                1 + F.cosine_similarity(clip_adv_embs, clip_prompt_embs).mean()
+            ) / loss_factor
+            total_loss = (
+                distillation_loss * config.distillation_weight
+                + target_prompt_loss * config.target_weight
+                + adversarial_loss * config.adversarial_weight
+            )
+            accelerator.backward(total_loss, retain_graph=True)
+            loss_dict.accumulate(
+                StatsDict(
+                    total=total_loss,
+                    distillation=distillation_loss,
+                    adversarial=adversarial_loss,
+                    target=target_prompt_loss,
+                ).itemize()
+            )
 
-        total_loss = (
-            config.distillation_weight * distillation_loss
-            + config.target_weight * target_prompt_loss
-            + config.adversarial_weight * adversarial_loss
-        )
-        return StatsDict(
-            total=total_loss,
-            distillation=distillation_loss.item(),
-            target=target_prompt_loss.item(),
-            adversarial=adversarial_loss.item(),
-        )
+        return loss_dict
 
     @torch.no_grad()
     def test_step(self, batch) -> StatsDict:
