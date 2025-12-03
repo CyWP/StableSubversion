@@ -14,7 +14,7 @@ from typing import Dict, Tuple, List, Union
 from .config import Config
 from .dataset import PromptDataset
 from .model import StableSubversionPipeline
-from .utils import CLIPModule, StatsDict, ImgTransform
+from .utils import EasyDict, StatsDict, ImgTransform
 
 
 class Trainer:
@@ -41,18 +41,25 @@ class Trainer:
             f.write("\n")
 
     def log_images(
-        self, imgs: Union[torch.Tensor, List[Image.Image]], stats: List[StatsDict]
+        self,
+        base: List[Image.Image],
+        lora: List[Image.Image],
+        stats: list[StatsDict],
     ):
         epoch_dir = self.img_dir / str(self.current_epoch)
         if not epoch_dir.is_dir():
             Path.mkdir(epoch_dir, parents=True, exist_ok=True)
-        if isinstance(imgs, torch.Tensor):
-            imgs = ImgTransform.tensor2pil(imgs)
-        for img, stat in zip(imgs, stats):
+        for img_base, img_lora, info in zip(base, lora, stats):
+            if isinstance(img_lora, torch.Tensor):
+                img_lora = ImgTransform.tensor2pil(img_lora)
+            if isinstance(img_base, torch.Tensor):
+                img_lora = ImgTransform.tensor2pil(img_base)
             filename = md5(stat.prompt.encode("utf-8")).hexdigest()
-            img_path = epoch_dir / f"{filename}.png"
+            img_lora_path = epoch_dir / f"{filename}_lora.png"
+            img_base_path = epoch_dir / f"{filename}_base.png"
             stats_path = epoch_dir / f"{filename}.json"
-            img.save(img_path)
+            img_lora.save(img_lora_path)
+            img_base.save(img_base_path)
             with open(stats_path, "w") as f:
                 f.write(json.dumps(stat.itemize()))
 
@@ -67,6 +74,7 @@ class Trainer:
             config.model_name,
             dtype=torch.float16,
             use_safetensors=False,
+            safety_checker=None,
         ).to(device)
         self.pipe = pipe
         pipe.enable_attention_slicing()
@@ -79,9 +87,6 @@ class Trainer:
 
         optimizer = torch.optim.Adam(pipe.get_lora_params(), lr=config.lr)
         scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=config.sched_cycle)
-        self.clip = CLIPModule(device, config.clip_name)
-        self.clip.clip.eval()
-
         full_size = config.train_size + config.test_size
         dataset = PromptDataset(size=full_size, seed=config.generator)
         train_data, test_data = random_split(
@@ -104,10 +109,6 @@ class Trainer:
         pipe, optimizer, train_loader = accelerator.prepare(
             pipe, optimizer, train_loader
         )
-
-        # Precompute embeddings
-        with torch.no_grad():
-            self.target_clip_emb = self.clip.encode_text([target_prompt])
 
         # TRAINING
         accelerator.print(">> Starting training...")
@@ -157,7 +158,6 @@ class Trainer:
         config = self.config
         device = self.device
         pipe = self.pipe
-        accelerator = self.accelerator
         prompts = batch.prompt
         with torch.no_grad():
             text_embeds = pipe.embed_text(prompts)
@@ -167,41 +167,30 @@ class Trainer:
         step_interval = 1000 // num_steps
         pipe.scheduler.set_timesteps(num_steps)
         latent = pipe.get_initial_noise(B)
-        loss_dict = StatsDict(total=0, distillation=0, adversarial=0, target=0)
+        loss_dict = StatsDict(total=0, distillation=0, adversarial=0)
         for t in pipe.scheduler.timesteps:
-            target_clip_emb = self.target_clip_emb.clone()
-            latent = latent.detach().requires_grad_(True)
-            t = min(t, torch.tensor(1000 - step_interval - 1))
-            latent = pipe.denoise_step(latent, t, text_embeds, 1.0)
+            print("timestep", t)
+            t = min(t, torch.tensor(1000 - step_interval - 1)).item()
+            lora_latent = pipe.denoise_step(latent, t, text_embeds, 1.0)
             with torch.no_grad(), pipe.lora_disabled():
-                noised = pipe.add_noise(latent, t)
-                denoised = pipe.denoise_step(noised, t, text_embeds, 1.0)
-            distillation_loss = F.mse_loss(latent, denoised) / loss_factor
-
-            imgs = pipe.decode_latents(latent)
-            clip_adv_embs = self.clip.encode_image(imgs)
-            clip_prompt_embs = self.clip.encode_text(prompts)
-            target_prompt_loss = (
-                1 - F.cosine_similarity(clip_adv_embs, target_clip_emb).mean()
-            ) / loss_factor
-            adversarial_loss = (
-                1 + F.cosine_similarity(clip_adv_embs, clip_prompt_embs).mean()
-            ) / loss_factor
+                base_latent = pipe.denoise_step(latent, t, text_embeds, 1.0)
+                renoised = pipe.add_noise(lora_latent, t)
+                base_denoised = pipe.denoise_step(renoised, t, text_embeds, 1.0)
+            distillation_loss = F.mse_loss(lora_latent, base_denoised) / loss_factor
+            adversarial_loss = F.mse_loss(lora_latent, base_latent) / loss_factor
             total_loss = (
-                distillation_loss * config.distillation_weight
-                + target_prompt_loss * config.target_weight
-                + adversarial_loss * config.adversarial_weight
+                config.distillation_weight * distillation_loss
+                - config.adversarial_weight * adversarial_loss
             )
-            accelerator.backward(total_loss, retain_graph=True)
+            total_loss.backward(retain_graph=True)
+            latent = lora_latent.detach()
             loss_dict.accumulate(
                 StatsDict(
                     total=total_loss,
                     distillation=distillation_loss,
                     adversarial=adversarial_loss,
-                    target=target_prompt_loss,
-                ).itemize()
+                )
             )
-
         return loss_dict
 
     @torch.no_grad()
@@ -211,34 +200,15 @@ class Trainer:
         inference_steps = self.config.test_inference_steps
         cfg = self.config.test_cfg
         pipe = self.pipe
-        imgs = self.pipe.generate(
+        with pipe.lora_disabled():
+            imgs_base = self.pipe.generate(
+                prompt, num_inference_steps=inference_steps, guidance_scale=cfg
+            )["images"]
+        imgs_lora = self.pipe.generate(
             prompt, num_inference_steps=inference_steps, guidance_scale=cfg
         )["images"]
-        imgs_tensor = ImgTransform.pil2tensor(imgs).to(self.device)
-        clip_img_emb = self.clip.encode_image(imgs_tensor)
-        clip_prompt_emb = self.clip.encode_text(prompt)
-        target_prompt_losses = [
-            1
-            - F.cosine_similarity(
-                clip_img_emb[i].unsqueeze(0), self.target_clip_emb
-            ).mean()
-            for i in range(B)
-        ]
-        adversarial_losses = [
-            1
-            + F.cosine_similarity(clip_img_emb[i].unsqueeze(0), clip_prompt_emb).mean()
-            for i in range(B)
-        ]
-        loss_dict = StatsDict(
-            target=target_prompt_losses, adversarial=adversarial_losses
-        )
         gen_stats = [
-            StatsDict(prompt=p, steps=inference_steps, cfg=cfg, target=t, adversarial=a)
-            for p, t, a in zip(prompt, target_prompt_losses, adversarial_losses)
+            StatsDict(cfg=cfg, steps=inference_steps, prompt=p) for p in prompt
         ]
-        self.log_images(imgs, gen_stats)
-        target_loss = torch.tensor(target_prompt_losses).mean()
-        adversarial_loss = torch.tensor(adversarial_losses).mean()
-        return StatsDict(
-            target_test=target_loss.item(), adversarial_test=adversarial_loss.item()
-        )
+        self.log_images(imgs_base, imgs_lora, gen_stats)
+        return StatsDict()

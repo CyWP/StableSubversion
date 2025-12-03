@@ -145,7 +145,7 @@ class StableSubversionPipeline(
         safety_checker,
         feature_extractor,
         image_encoder=None,
-        requires_safety_checker: bool = True,
+        requires_safety_checker: bool = False,
     ):
         sig = inspect.signature(super().__init__)
         params = sig.parameters
