@@ -99,10 +99,13 @@ class StatsDict(EasyDict):
 class ImgTransform:
 
     @staticmethod
-    def tensor2pil(img: torch.Tensor) -> Image.Image:
+    def tensor2pil(img: torch.Tensor) -> list[Image.Image]:
+        # img: [B, C, H, W] in [-1, 1]
         B, C, H, W = img.shape
-        img_reshaped = ((img.unsqueeze(0) + 1) * 0.5).permute(0, 2, 3, 1).cpu().numpy()
-        return [Image.fromarray(img_reshaped[i].unsqueeze(0)) for i in range(B)]
+        img_reshaped = (
+            ((img + 1) * 127.5).clamp(0, 255).byte().cpu().permute(0, 2, 3, 1)
+        )
+        return [Image.fromarray(img_reshaped[i].numpy()) for i in range(B)]
 
     @staticmethod
     def pil2tensor(img: Union[List[Image.Image], Image.Image]) -> torch.Tensor:

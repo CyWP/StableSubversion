@@ -28,6 +28,7 @@ class Config(EasyDict):
         "test_cfg": 1.0,
         "seed": 42,
         "sched_cycle": 20,
+        "hf_auth_token": 0,
     }
 
     def __init__(self, **kwargs):

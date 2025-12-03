@@ -16,6 +16,11 @@ from .dataset import PromptDataset
 from .model import StableSubversionPipeline
 from .utils import EasyDict, StatsDict, ImgTransform
 
+import logging
+
+logging.getLogger("diffusers").setLevel(logging.ERROR)
+logging.getLogger("transformers").setLevel(logging.ERROR)
+
 
 class Trainer:
 
@@ -42,19 +47,19 @@ class Trainer:
 
     def log_images(
         self,
-        base: List[Image.Image],
-        lora: List[Image.Image],
+        base: Union[List[Image.Image], torch.Tensor],
+        lora: Union[List[Image.Image], torch.Tensor],
         stats: list[StatsDict],
     ):
         epoch_dir = self.img_dir / str(self.current_epoch)
         if not epoch_dir.is_dir():
             Path.mkdir(epoch_dir, parents=True, exist_ok=True)
-        for img_base, img_lora, info in zip(base, lora, stats):
-            if isinstance(img_lora, torch.Tensor):
-                img_lora = ImgTransform.tensor2pil(img_lora)
-            if isinstance(img_base, torch.Tensor):
-                img_lora = ImgTransform.tensor2pil(img_base)
-            filename = md5(stat.prompt.encode("utf-8")).hexdigest()
+        if isinstance(lora, torch.Tensor):
+            lora = ImgTransform.tensor2pil(lora)
+        if isinstance(base, torch.Tensor):
+            base = ImgTransform.tensor2pil(base)
+        for img_base, img_lora, stat in zip(base, lora, stats):
+            filename = "_".join(stat.prompt.split(" "))
             img_lora_path = epoch_dir / f"{filename}_lora.png"
             img_base_path = epoch_dir / f"{filename}_base.png"
             stats_path = epoch_dir / f"{filename}.json"
@@ -69,13 +74,14 @@ class Trainer:
         self.accelerator = accelerator
         device = accelerator.device
         self.device = device
-
         pipe = StableSubversionPipeline.from_pretrained(
             config.model_name,
             dtype=torch.float16,
-            use_safetensors=False,
+            use_safetensors=True,
             safety_checker=None,
+            use_auth_token=config.hf_auth_token or False,
         ).to(device)
+        pipe.set_progress_bar_config(disable=True)
         self.pipe = pipe
         pipe.enable_attention_slicing()
         pipe.enable_vae_slicing()
@@ -86,7 +92,9 @@ class Trainer:
         target_prompt = config.target_prompt
 
         optimizer = torch.optim.Adam(pipe.get_lora_params(), lr=config.lr)
-        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=config.sched_cycle)
+        scheduler = CosineAnnealingWarmRestarts(
+            optimizer, T_0=config.sched_cycle, T_mult=2, eta_min=1e-6
+        )
         full_size = config.train_size + config.test_size
         dataset = PromptDataset(size=full_size, seed=config.generator)
         train_data, test_data = random_split(
@@ -132,7 +140,6 @@ class Trainer:
                         num_accumulated = 0
                         optimizer.step()
                         optimizer.zero_grad()
-            pipe.inspect_lora_weights()
             epoch_stats.divide(len(batch_bar))
             if epoch % config.test_interval == 0:
                 test_bar = tqdm(test_loader, desc=f"Epoch {epoch} Test")
@@ -155,6 +162,7 @@ class Trainer:
         return pipe
 
     def train_step(self, batch) -> StatsDict:
+        accelerator = self.accelerator
         config = self.config
         device = self.device
         pipe = self.pipe
@@ -169,7 +177,7 @@ class Trainer:
         latent = pipe.get_initial_noise(B)
         loss_dict = StatsDict(total=0, distillation=0, adversarial=0)
         for t in pipe.scheduler.timesteps:
-            print("timestep", t)
+            text_embeds = text_embeds.detach()
             t = min(t, torch.tensor(1000 - step_interval - 1)).item()
             lora_latent = pipe.denoise_step(latent, t, text_embeds, 1.0)
             with torch.no_grad(), pipe.lora_disabled():
@@ -182,31 +190,38 @@ class Trainer:
                 config.distillation_weight * distillation_loss
                 - config.adversarial_weight * adversarial_loss
             )
-            total_loss.backward(retain_graph=True)
+            accelerator.backward(total_loss, retain_graph=True)
             latent = lora_latent.detach()
             loss_dict.accumulate(
                 StatsDict(
                     total=total_loss,
                     distillation=distillation_loss,
                     adversarial=adversarial_loss,
-                )
+                ).itemize()
             )
         return loss_dict
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def test_step(self, batch) -> StatsDict:
         prompt = batch["prompt"]
         B = len(prompt)
         inference_steps = self.config.test_inference_steps
         cfg = self.config.test_cfg
         pipe = self.pipe
+        latent = pipe.get_initial_noise(B)
         with pipe.lora_disabled():
-            imgs_base = self.pipe.generate(
-                prompt, num_inference_steps=inference_steps, guidance_scale=cfg
-            )["images"]
-        imgs_lora = self.pipe.generate(
-            prompt, num_inference_steps=inference_steps, guidance_scale=cfg
-        )["images"]
+            imgs_base = self.pipe.generate_from_latent(
+                prompt,
+                latents=latent,
+                num_inference_steps=inference_steps,
+                guidance_scale=cfg,
+            )
+        imgs_lora = self.pipe.generate_from_latent(
+            prompt,
+            latents=latent,
+            num_inference_steps=inference_steps,
+            guidance_scale=cfg,
+        )
         gen_stats = [
             StatsDict(cfg=cfg, steps=inference_steps, prompt=p) for p in prompt
         ]

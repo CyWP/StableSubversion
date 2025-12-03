@@ -412,3 +412,25 @@ class StableSubversionPipeline(
             guidance_scale=guidance_scale,
             **kwargs,
         )
+
+    @torch.no_grad()
+    def generate_from_latent(
+        self,
+        prompt,
+        negative_prompt=None,
+        latents=None,
+        num_inference_steps=30,
+        guidance_scale=7.5,
+        **kwargs,
+    ):
+        text_embeds = self.embed_text(prompt, negative_prompt)
+        B = text_embeds.shape[0] // 2 if negative_prompt else text_embeds.shape[0]
+        if latents is None:
+            latents = self.get_initial_noise(B)  # shape: [B, C, H/8, W/8]
+        else:
+            latents = latents.to(self.device)
+        self.scheduler.set_timesteps(num_inference_steps)
+        for t in self.scheduler.timesteps:
+            latents = self.denoise_step(latents, t, text_embeds, guidance_scale)
+        images = self.decode_latents(latents)
+        return images
