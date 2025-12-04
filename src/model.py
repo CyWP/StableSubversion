@@ -9,7 +9,7 @@ from diffusers.models.attention_processor import (
     LoRAAttnProcessor2_0,
 )
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Union
 
 
 class ToggledAttnProc(LoRAAttnProcessor2_0):
@@ -209,6 +209,7 @@ class StableSubversionPipeline(
         unet = self.unet
         lora_procs = {}
         device = self.unet.device
+        self.lora_rank = rank
         for n, base in self.unet.attn_processors.items():
             cross_attention_dim = (
                 None
@@ -241,30 +242,26 @@ class StableSubversionPipeline(
                 f"param: {param.shape}, min: {param.min()}, max: {param.max()}, mean: {param.mean()}"
             )
 
-    def load_lora(self, path: Path):
-        loaded_state = torch.load(path, map_location=self.device)
-        unet_lora_attn_procs = {}
-        for attn_name, st in loaded_state.items():
-            # Recreate a LoRA processor with the correct sizes
-            hidden_size = st["lora_down.weight"].shape[1]  # typical for LoRA
-            cross_attention_dim = st.get("lora_up.weight", None)
-            cross_attention_dim = (
-                cross_attention_dim.shape[0]
-                if cross_attention_dim is not None
-                else None
-            )
-            proc = ToggledAttnProc(
-                hidden_size=hidden_size,
-                cross_attention_dim=cross_attention_dim,
-                rank=st["lora_up.weight"].shape[1],
-            )
-            proc.load_state_dict(st)
-            unet_lora_attn_procs[attn_name] = proc
-        self.unet.set_attn_processor(unet_lora_attn_procs)
+    def load_lora(self, state: Union[Path, Dict]):
+        if isinstance(state, Path):
+            state = torch.load(state)
+        loaded_state = {
+            k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+            for k, v in state.items()
+        }
+        rank = loaded_state["rank"]
+        del loaded_state["rank"]
+        self.create_lora(rank)
+        self.unet.load_state_dict(loaded_state, strict=False)
+
+    def lora_state_dict(self) -> Dict:
+        sd = {"rank": self.lora_rank}
+        for k, v in self.get_lora_procs().items():
+            sd.update({f"{k}.{k2}": v2 for k2, v2 in v.state_dict().items()})
+        return sd
 
     def save_lora(self, path: Path):
-        state = {k: v.state_dict() for k, v in self.get_lora_procs().items()}
-        torch.save(state, path)
+        torch.save(self.lora_state_dict(), path)
 
     def enable_lora(self):
         for proc in self.get_lora_procs().values():
@@ -400,7 +397,7 @@ class StableSubversionPipeline(
     def generate(
         self,
         prompt,
-        negative_prompt=None,
+        negative_prompt="",
         num_inference_steps=30,
         guidance_scale=7.5,
         **kwargs,
@@ -417,7 +414,7 @@ class StableSubversionPipeline(
     def generate_from_latent(
         self,
         prompt,
-        negative_prompt=None,
+        negative_prompt="",
         latents=None,
         num_inference_steps=30,
         guidance_scale=7.5,
@@ -434,3 +431,36 @@ class StableSubversionPipeline(
             latents = self.denoise_step(latents, t, text_embeds, guidance_scale)
         images = self.decode_latents(latents)
         return images
+
+
+class LoRAEMA:
+    def __init__(self, pipe: StableSubversionPipeline, decay: float = 0.9):
+        self.pipe = pipe
+        self.decay = decay
+        self.shadow = pipe.lora_state_dict()
+
+    @torch.no_grad()
+    def update(self):
+        new_state = self.pipe.lora_state_dict()
+        for k, v in self.shadow.items():
+            if isinstance(v, torch.Tensor):
+                self.shadow[k] = self.decay * v + (1 - self.decay) * new_state[k]
+            else:
+                v = new_state[k]
+
+    @torch.no_grad()
+    def save(self, path: Path):
+        torch.save(self.shadow, path)
+
+    @torch.no_grad()
+    def apply(self):
+        self.pipe.load_lora(self.shadow)
+
+    @contextmanager
+    def applied(self):
+        init_sd = self.pipe.lora_state_dict()
+        self.pipe.load_lora(self.shadow)
+        try:
+            yield self.pipe
+        finally:
+            self.pipe.load_lora(init_sd)
